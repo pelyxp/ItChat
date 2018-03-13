@@ -1,12 +1,10 @@
-import os, time, re, io
+import time, re, io
 import json, copy
-import traceback, logging
-
-import requests
+import logging
 
 from .. import config, utils
 from ..returnvalues import ReturnValue
-from ..storage import contact_change, templates
+from ..storage import contact_change
 from ..utils import update_info_dict
 
 logger = logging.getLogger('itchat')
@@ -148,8 +146,9 @@ def update_local_chatrooms(core, l):
                 del oldChatroom['MemberList'][i]
         #  - update OwnerUin
         if oldChatroom.get('ChatRoomOwner') and oldChatroom.get('MemberList'):
-            oldChatroom['OwnerUin'] = utils.search_dict_list(oldChatroom['MemberList'],
-                'UserName', oldChatroom['ChatRoomOwner']).get('Uin', 0)
+            owner = utils.search_dict_list(oldChatroom['MemberList'],
+                'UserName', oldChatroom['ChatRoomOwner'])
+            oldChatroom['OwnerUin'] = (owner or {}).get('Uin', 0)
         #  - update IsAdmin
         if 'OwnerUin' in oldChatroom and oldChatroom['OwnerUin'] != 0:
             oldChatroom['IsAdmin'] = \
@@ -406,7 +405,7 @@ def get_head_img(self, userName=None, chatroomUserName=None, picDir=None):
                     'Ret': -1001, }})
             if 'EncryChatRoomId' in chatroom:
                 params['chatroomid'] = chatroom['EncryChatRoomId']
-            params['chatroomid'] =  params['chatroomid'] or chatroom['UserName']
+            params['chatroomid'] =  params.get('chatroomid') or chatroom['UserName']
     headers = { 'User-Agent' : config.USER_AGENT }
     r = self.s.get(url, params=params, stream=True, headers=headers)
     tempStorage = io.BytesIO()

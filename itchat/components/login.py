@@ -1,8 +1,12 @@
-import os, sys, time, re, io
+import os, time, re, io
 import threading
 import json, xml.dom.minidom
-import copy, pickle, random
+import random
 import traceback, logging
+try:
+    from httplib import BadStatusLine
+except ImportError:
+    from http.client import BadStatusLine
 
 import requests
 from pyqrcode import QRCode
@@ -59,7 +63,8 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
                 break
         if isLoggedIn:
             break
-        logger.info('Log in time out, reloading QR code.')
+        elif self.isLogging:
+            logger.info('Log in time out, reloading QR code.')
     else:
         return # log in process is stopped by user
     logger.info('Loading the contact, this may take a little while.')
@@ -122,15 +127,17 @@ def check_login(self, uuid=None):
     uuid = uuid or self.uuid
     url = '%s/cgi-bin/mmwebwx-bin/login' % config.BASE_URL
     localTime = int(time.time())
-    params = 'loginicon=true&uuid=%s&tip=0&r=%s&_=%s' % (
-        uuid, localTime / 1579, localTime)
+    params = 'loginicon=true&uuid=%s&tip=1&r=%s&_=%s' % (
+        uuid, int(-localTime / 1579), localTime)
     headers = { 'User-Agent' : config.USER_AGENT }
     r = self.s.get(url, params=params, headers=headers)
     regx = r'window.code=(\d+)'
     data = re.search(regx, r.text)
     if data and data.group(1) == '200':
-        process_login_info(self, r.text)
-        return '200'
+        if process_login_info(self, r.text):
+            return '200'
+        else:
+            return '400'
     elif data:
         return data.group(1)
     else:
@@ -161,6 +168,7 @@ def process_login_info(core, loginContent):
     else:
         core.loginInfo['fileUrl'] = core.loginInfo['syncUrl'] = core.loginInfo['url']
     core.loginInfo['deviceid'] = 'e' + repr(random.random())[2:17]
+    core.loginInfo['logintime'] = int(time.time() * 1e3)
     core.loginInfo['BaseRequest'] = {}
     for node in xml.dom.minidom.parseString(r.text).documentElement.childNodes:
         if node.nodeName == 'skey':
@@ -171,14 +179,22 @@ def process_login_info(core, loginContent):
             core.loginInfo['wxuin'] = core.loginInfo['BaseRequest']['Uin'] = node.childNodes[0].data
         elif node.nodeName == 'pass_ticket':
             core.loginInfo['pass_ticket'] = core.loginInfo['BaseRequest']['DeviceID'] = node.childNodes[0].data
+    if not all([key in core.loginInfo for key in ('skey', 'wxsid', 'wxuin', 'pass_ticket')]):
+        logger.error('Your wechat account may be LIMITED to log in WEB wechat, error info:\n%s' % r.text)
+        core.isLogging = False
+        return False
+    return True
 
 def web_init(self):
-    url = '%s/webwxinit?r=%s' % (self.loginInfo['url'], int(time.time()))
+    url = '%s/webwxinit' % self.loginInfo['url']
+    params = {
+        'r': int(-time.time() / 1579),
+        'pass_ticket': self.loginInfo['pass_ticket'], }
     data = { 'BaseRequest': self.loginInfo['BaseRequest'], }
     headers = {
         'ContentType': 'application/json; charset=UTF-8',
         'User-Agent' : config.USER_AGENT, }
-    r = self.s.post(url, data=json.dumps(data), headers=headers)
+    r = self.s.post(url, params=params, data=json.dumps(data), headers=headers)
     dic = json.loads(r.content.decode('utf-8', 'replace'))
     # deal with login info
     utils.emoji_formatter(dic['User'], 'NickName')
@@ -191,19 +207,19 @@ def web_init(self):
     self.storageClass.userName = dic['User']['UserName']
     self.storageClass.nickName = dic['User']['NickName']
     # deal with contact list returned when init
-    contactList = dic.get('ContactList', [])		
-    chatroomList, otherList = [], []		
-    for m in contactList:		
-        if m['Sex'] != 0:		
-            otherList.append(m)		
-        elif '@@' in m['UserName']:		
+    contactList = dic.get('ContactList', [])
+    chatroomList, otherList = [], []
+    for m in contactList:
+        if m['Sex'] != 0:
+            otherList.append(m)
+        elif '@@' in m['UserName']:
             m['MemberList'] = [] # don't let dirty info pollute the list
-            chatroomList.append(m)		
-        elif '@' in m['UserName']:		
-            # mp will be dealt in update_local_friends as well		
-            otherList.append(m)		
+            chatroomList.append(m)
+        elif '@' in m['UserName']:
+            # mp will be dealt in update_local_friends as well
+            otherList.append(m)
     if chatroomList:
-        update_local_chatrooms(self, chatroomList)		
+        update_local_chatrooms(self, chatroomList)
     if otherList:
         update_local_friends(self, otherList)
     return dic
@@ -252,6 +268,8 @@ def start_receiving(self, exitCallback=None, getReceivingFnOnly=False):
                         self.msgList.put(chatroomMsg)
                         update_local_friends(self, otherList)
                 retryCount = 0
+            except requests.exceptions.ReadTimeout:
+                pass
             except:
                 retryCount += 1
                 logger.error(traceback.format_exc())
@@ -280,9 +298,23 @@ def sync_check(self):
         'uin'      : self.loginInfo['wxuin'],
         'deviceid' : self.loginInfo['deviceid'],
         'synckey'  : self.loginInfo['synckey'],
-        '_'        : int(time.time() * 1000),}
+        '_'        : self.loginInfo['logintime'], }
     headers = { 'User-Agent' : config.USER_AGENT }
-    r = self.s.get(url, params=params, headers=headers, timeout=config.TIMEOUT)
+    self.loginInfo['logintime'] += 1
+    try:
+        r = self.s.get(url, params=params, headers=headers, timeout=config.TIMEOUT)
+    except requests.exceptions.ConnectionError as e:
+        try:
+            if not isinstance(e.args[0].args[1], BadStatusLine):
+                raise
+            # will return a package with status '0 -'
+            # and value like:
+            # 6f:00:8a:9c:09:74:e4:d8:e0:14:bf:96:3a:56:a0:64:1b:a4:25:5d:12:f4:31:a5:30:f1:c6:48:5f:c3:75:6a:99:93
+            # seems like status of typing, but before I make further achievement code will remain like this
+            return '2'
+        except:
+            raise
+    r.raise_for_status()
     regx = r'window.synccheck={retcode:"(\d+)",selector:"(\d+)"}'
     pm = re.search(regx, r.text)
     if pm is None or pm.group(1) != '0':
@@ -304,7 +336,7 @@ def get_msg(self):
     r = self.s.post(url, data=json.dumps(data), headers=headers, timeout=config.TIMEOUT)
     dic = json.loads(r.content.decode('utf-8', 'replace'))
     if dic['BaseResponse']['Ret'] != 0: return None, None
-    self.loginInfo['SyncKey'] = dic['SyncCheckKey']
+    self.loginInfo['SyncKey'] = dic['SyncKey']
     self.loginInfo['synckey'] = '|'.join(['%s_%s' % (item['Key'], item['Val'])
         for item in dic['SyncCheckKey']['List']])
     return dic['AddMsgList'], dic['ModContactList']
